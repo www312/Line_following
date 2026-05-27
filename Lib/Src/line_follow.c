@@ -3,6 +3,7 @@
  * @brief Proportional steering + turn-hold with asymmetry extension
  */
 #include "line_follow.h"
+#include "delay_dwt.h"
 #include "ir_line8.h"
 #include "motion_car.h"
 
@@ -25,25 +26,37 @@ void LineWalking(void)
 	int16_t vz_search = (s_mode == MODE_RIGHT) ? -VZ_SEARCH : VZ_SEARCH;
 	int16_t vz_turn   = (s_mode == MODE_RIGHT) ? -VZ_TURN  : VZ_TURN;
 
-	/* junction entry: arm hold */
-	if ((left + right) > 4)
-		turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
-
-	uint8_t hold_active = IR_Line8_GetFrameCount() < turn_until;
-
-	/* still turning: extend hold while sensors asymmetric */
-	if (hold_active) {
-		int diff = left - right;
-		if (diff < 0) diff = -diff;
-		if (diff >= 2)
+	/* junction entry: arm hold only when line bias matches mode */
+	if ((left + right) > 4) {
+		if (s_mode == MODE_LEFT  && left > right)
+			turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
+		if (s_mode == MODE_RIGHT && right > left)
 			turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
 	}
 
-	/* all-black: mode-directed turn */
-	if ((left + right) == 8) {
-		turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
-		s_last_vz = vz_search;
-		Motion_Car_Control(IRR_SPEED, 0, vz_search);
+	uint8_t hold_active = IR_Line8_GetFrameCount() < turn_until;
+
+	/* still turning: extend hold only when asymmetry matches mode */
+	if (hold_active) {
+		int diff = left - right;
+		if (s_mode == MODE_LEFT  && diff >= 2)
+			turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
+		if (s_mode == MODE_RIGHT && -diff >= 2)
+			turn_until = IR_Line8_GetFrameCount() + TURN_HOLD;
+	}
+
+	/* symmetric junction: go straight 100ms, then check if cross or T */
+	if ((left + right) > 4 && left == right) {
+		Motion_Car_Control(IRR_SPEED, 0, 0);
+		delay_ms(100);
+		if (IR_Line8_Value[3] == 0 && IR_Line8_Value[4] == 0) {
+			/* cross: middle still on line → keep straight */
+			s_last_vz = 0;
+			Motion_Car_Control(IRR_SPEED, 0, 0);
+		} else {
+			s_last_vz = vz_search;
+			Motion_Car_Control(IRR_SPEED, 0, vz_search);
+		}
 		return;
 	}
 
@@ -63,6 +76,8 @@ void LineWalking(void)
 
 	/* deviating / turning: proportional with direction floor during hold */
 	int16_t vz = (int16_t)((right - left) * VZ_PER_ERR);
+	if (vz >  1500) vz =  1500;
+	if (vz < -1500) vz = -1500;
 	if (hold_active) {
 		if (s_mode == MODE_LEFT  && vz > vz_turn) vz = vz_turn;
 		if (s_mode == MODE_RIGHT && vz < vz_turn) vz = vz_turn;

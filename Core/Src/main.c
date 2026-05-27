@@ -26,7 +26,8 @@
 #include "line_follow.h"
 #include "motion_car.h"
 #include "motor_driver.h"
-#include "oled096.h"
+#include "u8g2.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,6 +37,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UI_STEP_MS 50U
+#define OLED_I2C_ADDR 0x3CU
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -50,7 +53,10 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+static uint32_t s_ui_last_tick;
 static uint32_t s_btn_last_tick;
+static u8g2_t s_u8g2;
+static uint8_t s_radar_mode; /* 0=follow, 1=radar */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,10 +66,128 @@ static void MX_I2C1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static void UI_DrawSensorScreen(void);
+static void UI_DrawRadarScreen(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---- u8g2 HAL callbacks ---- */
+uint8_t u8x8_gpio_and_delay(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+{
+	(void)u8x8; (void)arg_ptr;
+	switch (msg) {
+	case U8X8_MSG_DELAY_MILLI:
+		HAL_Delay(arg_int);
+		break;
+	case U8X8_MSG_GPIO_AND_DELAY_INIT:
+	case U8X8_MSG_DELAY_10MICRO:
+	case U8X8_MSG_GPIO_RESET:
+		break;
+	default: return 0;
+	}
+	return 1;
+}
+
+uint8_t u8x8_byte_hw_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
+{
+	(void)u8x8;
+	static uint8_t buf[128];
+	static uint8_t idx;
+
+	switch (msg) {
+	case U8X8_MSG_BYTE_START_TRANSFER:
+		idx = 0U;
+		break;
+	case U8X8_MSG_BYTE_SEND:
+		memcpy(buf + idx, arg_ptr, arg_int);
+		idx = (uint8_t)(idx + arg_int);
+		break;
+	case U8X8_MSG_BYTE_END_TRANSFER:
+		HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(OLED_I2C_ADDR << 1U),
+					buf, idx, 100U);
+		break;
+	case U8X8_MSG_BYTE_INIT:
+	case U8X8_MSG_BYTE_SET_DC:
+		break;
+	default: return 0;
+	}
+	return 1;
+}
+
+/* ---- OLED display: sensor dashboard ---- */
+static void UI_DrawSensorScreen(void)
+{
+	char buf[32];
+	uint8_t i;
+
+	u8g2_ClearBuffer(&s_u8g2);
+
+	/* Title */
+	u8g2_SetFont(&s_u8g2, u8g2_font_helvB08_tr);
+	u8g2_DrawStr(&s_u8g2, 24, 10, "GRAY SENSOR");
+
+	/* 8 indicator blocks: 14x22 px, 2px gap, S8 left→S1 right */
+	for (i = 0; i < 8; i++) {
+		uint8_t x = (uint8_t)(1U + (7U - i) * 16U);
+		if (IR_Line8_Value[i] == 0U)
+			u8g2_DrawBox(&s_u8g2, x, 18, 14, 22);
+		else
+			u8g2_DrawFrame(&s_u8g2, x, 18, 14, 22);
+	}
+
+	/* S1-S8 labels under blocks */
+	u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
+	for (i = 0; i < 8; i++) {
+		buf[0] = 'S'; buf[1] = (char)('1' + i); buf[2] = '\0';
+		u8g2_DrawStr(&s_u8g2, (uint8_t)(3U + (7U - i) * 16U), 50, buf);
+	}
+
+	/* Status line: show DET/CLE groups */
+	buf[0] = 'D'; buf[1] = ':';
+	for (i = 0; i < 8; i++)
+		buf[2 + i] = (char)('0' + (IR_Line8_Value[i] & 1U));
+	buf[10] = '\0';
+	u8g2_DrawStr(&s_u8g2, 0, 62, buf);
+
+	u8g2_SendBuffer(&s_u8g2);
+}
+
+/* ---- OLED display: radar mode ---- */
+static void UI_DrawRadarScreen(void)
+{
+	const u8g2_uint_t cx = 64, cy = 28;
+
+	u8g2_ClearBuffer(&s_u8g2);
+
+	/* 3 concentric circles */
+	u8g2_DrawCircle(&s_u8g2, cx, cy,  9, U8G2_DRAW_ALL);
+	u8g2_DrawCircle(&s_u8g2, cx, cy, 18, U8G2_DRAW_ALL);
+	u8g2_DrawCircle(&s_u8g2, cx, cy, 27, U8G2_DRAW_ALL);
+
+	/* crosshair */
+	u8g2_DrawHLine(&s_u8g2, cx - 27, cy, 54);
+	u8g2_DrawVLine(&s_u8g2, cx, cy - 27, 54);
+
+	/* dummy target at 45 deg, r=15 */
+	u8g2_DrawPixel(&s_u8g2, cx + 11, cy - 11);
+
+	/* angle labels */
+	u8g2_SetFont(&s_u8g2, u8g2_font_u8glib_4_tr);
+	u8g2_DrawStr(&s_u8g2, 94, 29, "0");
+	u8g2_DrawStr(&s_u8g2, 87,  9, "45");
+	u8g2_DrawStr(&s_u8g2, 60,  2, "90");
+	u8g2_DrawStr(&s_u8g2, 36,  9, "135");
+	u8g2_DrawStr(&s_u8g2, 28, 29, "180");
+	u8g2_DrawStr(&s_u8g2, 36, 50, "225");
+	u8g2_DrawStr(&s_u8g2, 58, 60, "270");
+	u8g2_DrawStr(&s_u8g2, 87, 50, "315");
+
+	/* status */
+	u8g2_DrawStr(&s_u8g2, 0, 62, "D:--cm A:--");
+
+	u8g2_SendBuffer(&s_u8g2);
+}
 /* USER CODE END 0 */
 
 /**
@@ -100,10 +224,14 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   delay_init();
-  OLED096_Init();
   IR_Line8_Init();
   IIC_Motor_Init();
   Set_Motor(2);
+  u8g2_Setup_ssd1306_i2c_128x64_noname_f(&s_u8g2, U8G2_R0,
+      u8x8_byte_hw_i2c, u8x8_gpio_and_delay);
+  u8g2_InitDisplay(&s_u8g2);
+  u8g2_SetPowerSave(&s_u8g2, 0);
+  s_ui_last_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -116,15 +244,27 @@ int main(void)
     IR_Line8_PollRx();
     LineWalking();
 
-    /* button polling: PB12=left, PB13=right, 200ms debounce */
+    /* button: PB12=radar toggle, PB13=left↔right, 200ms debounce */
     if ((uint32_t)(HAL_GetTick() - s_btn_last_tick) >= 200U) {
       if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_RESET) {
-        LineFollow_SetMode(MODE_LEFT);
+        s_radar_mode = (uint8_t)(!s_radar_mode);
         s_btn_last_tick = HAL_GetTick();
       } else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) {
-        LineFollow_SetMode(MODE_RIGHT);
+        if (!s_radar_mode)
+          LineFollow_SetMode(LineFollow_GetMode() == MODE_LEFT ? MODE_RIGHT : MODE_LEFT);
         s_btn_last_tick = HAL_GetTick();
       }
+    }
+
+    if (!s_radar_mode)
+      LineWalking();
+
+    if ((uint32_t)(HAL_GetTick() - s_ui_last_tick) >= UI_STEP_MS) {
+      s_ui_last_tick = HAL_GetTick();
+      if (s_radar_mode)
+        UI_DrawRadarScreen();
+      else
+        UI_DrawSensorScreen();
     }
   }
   /* USER CODE END 3 */
@@ -185,7 +325,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;

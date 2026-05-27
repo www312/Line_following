@@ -8,9 +8,9 @@
 #include <stdint.h>
 
 #define IRR_SPEED     150   /* forward speed when line visible */
-#define VZ_PER_ERR    500   /* Vz gain per probe offset (small steer) */
+#define VZ_PER_ERR    475   /* Vz gain per probe offset (small steer) */
 #define VZ_SEARCH   -3000   /* Vz for lost-line pivot search (negative = left) */
-#define TURN_HOLD      8   /* sensor frames to hold turn after junction */
+#define TURN_HOLD     30   /* sensor frames to hold turn after junction */
 #define VZ_TURN      -2000   /* Vz floor during turn hold (negative = left) */
 
 typedef enum { MODE_LEFT = 0, MODE_RIGHT = 1 } LineFollow_Mode;
