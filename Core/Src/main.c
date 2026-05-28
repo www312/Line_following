@@ -26,19 +26,24 @@
 #include "line_follow.h"
 #include "motion_car.h"
 #include "motor_driver.h"
+#include "f302_radar_uart.h"
 #include "u8g2.h"
+#include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum { RADAR_FOLLOW, RADAR_STOPPED, RADAR_AVOID } radar_state_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define UI_STEP_MS 50U
 #define OLED_I2C_ADDR 0x3CU
+#define RADAR_WAIT_TIMEOUT_MS 30000U
+#define RADAR_AVOID_TIMEOUT_MS 15000U
+#define RADAR_TARGET_CONFIRM   5U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,6 +62,13 @@ static uint32_t s_ui_last_tick;
 static uint32_t s_btn_last_tick;
 static u8g2_t s_u8g2;
 static uint8_t s_radar_mode; /* 0=follow, 1=radar */
+static radar_state_t s_radar_state = RADAR_FOLLOW;
+static uint32_t       s_radar_allblack_tick;
+static uint32_t       s_radar_target_tick;
+static LineFollow_Mode s_pre_radar_mode;
+static uint8_t        s_radar_avoid_dir;
+static uint8_t        s_radar_target_cnt;
+static uint8_t        s_radar_triggered_once; /* OpenMV P0 只触发一次 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,6 +84,45 @@ static void UI_DrawRadarScreen(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---- radar polar coordinate helpers ---- */
+#define RADAR_CX 64
+#define RADAR_CY 50
+#define RADAR_R  28
+#define RADAR_TARGET_R 40
+#define RADAR_RANGE_MAX 300
+
+static const int16_t SIN256[121] = {
+	-222, -219, -217, -215, -212, -210, -207, -204, -202, -199, -196, -193, -190, -187,
+	-184, -181, -178, -175, -171, -168, -165, -161, -158, -154, -150, -147, -143, -139,
+	-136, -132, -128, -124, -120, -116, -112, -108, -104, -100, -96,  -92,  -88,  -83,
+	-79,  -75,  -71,  -66,  -62,  -58,  -53,  -49,  -44,  -40,  -36,  -31,  -27,  -22,
+	-18,  -13,  -9,   -4,   0,
+	4,    9,    13,   18,   22,   27,   31,   36,   40,   44,   49,   53,   58,   62,
+	66,   71,   75,   79,   83,   88,   92,   96,   100,  104,  108,  112,  116,  120,
+	124,  128,  132,  136,  139,  143,  147,  150,  154,  158,  161,  165,  168,  171,
+	175,  178,  181,  184,  187,  190,  193,  196,  199,  202,  204,  207,  210,  212,
+	215,  217,  219,  222,
+};
+static const int16_t COS256[121] = {
+	128, 132, 136, 139, 143, 147, 150, 154, 158, 161, 165, 168, 171, 175, 178, 181, 184,
+	187, 190, 193, 196, 199, 202, 204, 207, 210, 212, 215, 217, 219, 222, 224, 226, 228,
+	230, 232, 234, 236, 237, 239, 241, 242, 243, 245, 246, 247, 248, 249, 250, 251, 252,
+	253, 254, 254, 255, 255, 255, 256, 256, 256, 256, 256, 256, 256, 255, 255, 255, 254,
+	254, 253, 252, 251, 250, 249, 248, 247, 246, 245, 243, 242, 241, 239, 237, 236, 234,
+	232, 230, 228, 226, 224, 222, 219, 217, 215, 212, 210, 207, 204, 202, 199, 196, 193,
+	190, 187, 184, 181, 178, 175, 171, 168, 165, 161, 158, 154, 150, 147, 143, 139, 136,
+	132, 128,
+};
+
+static void radar_polar(int16_t deg, int16_t r_px, int16_t *dx, int16_t *dy)
+{
+	int idx = (int)deg + 60;
+	if (idx < 0)  idx = 0;
+	if (idx > 120) idx = 120;
+	*dx = (int16_t)((r_px * SIN256[idx]) / 256);
+	*dy = (int16_t)(-(r_px * COS256[idx]) / 256);
+}
+
 /* ---- u8g2 HAL callbacks ---- */
 uint8_t u8x8_gpio_and_delay(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
@@ -156,35 +207,100 @@ static void UI_DrawSensorScreen(void)
 /* ---- OLED display: radar mode ---- */
 static void UI_DrawRadarScreen(void)
 {
-	const u8g2_uint_t cx = 64, cy = 28;
+	f302_target_t rd;
+	uint8_t linked = F302_Radar_IsLinked();
+	char buf[32];
+	uint32_t now = HAL_GetTick();
+	int16_t fan_deg[] = { -60, -40, -20, 0, 20, 40, 60 };
+	uint8_t i;
 
 	u8g2_ClearBuffer(&s_u8g2);
 
+	/* top info: distance + angle */
+	u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
+	if (!linked) {
+		u8g2_DrawStr(&s_u8g2, 0, 10, "F302 WAIT");
+	} else {
+		F302_Radar_GetTarget(&rd);
+		if (rd.have_target) {
+			snprintf(buf, sizeof(buf), "R %u.%02um",
+				 (unsigned)(rd.range_0p01m / 100),
+				 (unsigned)(rd.range_0p01m % 100));
+			u8g2_DrawStr(&s_u8g2, 0, 10, buf);
+			snprintf(buf, sizeof(buf), "A %d",
+				 (int)(rd.angle_0p01deg / 100));
+			u8g2_DrawStr(&s_u8g2, 80, 10, buf);
+		} else {
+			u8g2_DrawStr(&s_u8g2, 0, 10, "CLEAR");
+		}
+	}
+
+	/* fan rays */
+	for (i = 0; i < 7; i++) {
+		int16_t dx, dy;
+		radar_polar(fan_deg[i], RADAR_R, &dx, &dy);
+		u8g2_DrawLine(&s_u8g2, RADAR_CX, RADAR_CY,
+			      (u8g2_uint_t)(RADAR_CX + dx),
+			      (u8g2_uint_t)(RADAR_CY + dy));
+	}
+
 	/* 3 concentric circles */
-	u8g2_DrawCircle(&s_u8g2, cx, cy,  9, U8G2_DRAW_ALL);
-	u8g2_DrawCircle(&s_u8g2, cx, cy, 18, U8G2_DRAW_ALL);
-	u8g2_DrawCircle(&s_u8g2, cx, cy, 27, U8G2_DRAW_ALL);
+	u8g2_DrawCircle(&s_u8g2, RADAR_CX, RADAR_CY,  9, U8G2_DRAW_ALL);
+	u8g2_DrawCircle(&s_u8g2, RADAR_CX, RADAR_CY, 19, U8G2_DRAW_ALL);
+	u8g2_DrawCircle(&s_u8g2, RADAR_CX, RADAR_CY, 28, U8G2_DRAW_ALL);
 
-	/* crosshair */
-	u8g2_DrawHLine(&s_u8g2, cx - 27, cy, 54);
-	u8g2_DrawVLine(&s_u8g2, cx, cy - 27, 54);
+	/* center dot */
+	u8g2_DrawBox(&s_u8g2, RADAR_CX - 1, RADAR_CY - 1, 3, 3);
 
-	/* dummy target at 45 deg, r=15 */
-	u8g2_DrawPixel(&s_u8g2, cx + 11, cy - 11);
+	/* target */
+	if (linked) {
+		F302_Radar_GetTarget(&rd);
+		if (rd.have_target) {
+			int16_t deg  = (int16_t)(rd.angle_0p01deg / 100);
+			int32_t rpx  = ((int32_t)rd.range_0p01m * RADAR_TARGET_R)
+				       / RADAR_RANGE_MAX;
+			int16_t dx, dy;
 
-	/* angle labels */
-	u8g2_SetFont(&s_u8g2, u8g2_font_u8glib_4_tr);
-	u8g2_DrawStr(&s_u8g2, 94, 29, "0");
-	u8g2_DrawStr(&s_u8g2, 87,  9, "45");
-	u8g2_DrawStr(&s_u8g2, 60,  2, "90");
-	u8g2_DrawStr(&s_u8g2, 36,  9, "135");
-	u8g2_DrawStr(&s_u8g2, 28, 29, "180");
-	u8g2_DrawStr(&s_u8g2, 36, 50, "225");
-	u8g2_DrawStr(&s_u8g2, 58, 60, "270");
-	u8g2_DrawStr(&s_u8g2, 87, 50, "315");
+			if (rpx < 2)  rpx = 2;
+			if (rpx > RADAR_TARGET_R) rpx = RADAR_TARGET_R;
+			radar_polar(deg, (int16_t)rpx, &dx, &dy);
+			u8g2_uint_t tx = (u8g2_uint_t)(RADAR_CX + dx);
+			u8g2_uint_t ty = (u8g2_uint_t)(RADAR_CY + dy);
 
-	/* status */
-	u8g2_DrawStr(&s_u8g2, 0, 62, "D:--cm A:--");
+			if (tx >= 2) tx -= 2; else tx = 0;
+			if (ty >= 2) ty -= 2; else ty = 0;
+			u8g2_DrawBox(&s_u8g2, tx, ty, 4, 4);
+		}
+	}
+
+		/* status bar */
+		u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
+		switch (s_radar_state) {
+		case RADAR_FOLLOW:
+			snprintf(buf, sizeof(buf), "FOLLOW");
+			break;
+		case RADAR_STOPPED: {
+			uint32_t elapsed = (now - s_radar_allblack_tick) / 1000U;
+			if (s_radar_target_cnt > 0U)
+				snprintf(buf, sizeof(buf), "STOP c%u/5",
+					 (unsigned)s_radar_target_cnt);
+			else
+				snprintf(buf, sizeof(buf), "STOP %lus",
+					 (unsigned long)elapsed);
+			break;
+		}
+		case RADAR_AVOID: {
+			uint32_t remain = 0U;
+			if (now < s_radar_target_tick + RADAR_AVOID_TIMEOUT_MS)
+				remain = (s_radar_target_tick + RADAR_AVOID_TIMEOUT_MS
+					  - now) / 1000U;
+			snprintf(buf, sizeof(buf), "AVOID %c %lus",
+				 (s_radar_avoid_dir == MODE_RIGHT) ? 'R' : 'L',
+				 (unsigned long)remain);
+			break;
+		}
+		}
+		u8g2_DrawStr(&s_u8g2, 0, 62, buf);
 
 	u8g2_SendBuffer(&s_u8g2);
 }
@@ -231,6 +347,7 @@ int main(void)
       u8x8_byte_hw_i2c, u8x8_gpio_and_delay);
   u8g2_InitDisplay(&s_u8g2);
   u8g2_SetPowerSave(&s_u8g2, 0);
+  F302_Radar_Init(&huart1);
   s_ui_last_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
@@ -242,12 +359,97 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     IR_Line8_PollRx();
-    LineWalking();
+    F302_Radar_Poll();
+
+    /* ---- radar state machine ---- */
+    /* OpenMV P0 → PB14: enter radar mode (same as PB12), one-shot only */
+    /* skip check in first 1s to avoid false trigger during OpenMV boot */
+    if (!s_radar_mode && !s_radar_triggered_once
+        && HAL_GetTick() > 1000U
+        && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14) == GPIO_PIN_SET) {
+      s_radar_triggered_once = 1;
+      s_pre_radar_mode = LineFollow_GetMode();
+      s_radar_state    = RADAR_FOLLOW;
+      s_radar_mode     = 1U;
+    }
+
+    if (s_radar_mode) {
+      uint32_t now = HAL_GetTick();
+      uint8_t all_black = 1U;
+      f302_target_t rd;
+
+      for (uint8_t i = 0U; i < 8U; i++) {
+        if (IR_Line8_Value[i] != 0U) { all_black = 0U; break; }
+      }
+
+      switch (s_radar_state) {
+      case RADAR_FOLLOW:
+        if (all_black) {
+          Motion_Car_Control(0, 0, 0);
+          s_radar_allblack_tick = now;
+          s_radar_target_cnt   = 0U;
+          s_radar_state = RADAR_STOPPED;
+        } else {
+          LineWalking();
+        }
+        break;
+
+      case RADAR_STOPPED:
+        /* wait timeout: 30s no target → back to follow */
+        if (now - s_radar_allblack_tick > RADAR_WAIT_TIMEOUT_MS) {
+          s_radar_state = RADAR_FOLLOW;
+          break;
+        }
+        F302_Radar_GetTarget(&rd);
+        if (rd.have_target) {
+          s_radar_target_cnt++;
+          if (s_radar_target_cnt >= RADAR_TARGET_CONFIRM) {
+            s_radar_target_tick = now;
+            if (rd.angle_0p01deg < 0) {
+              /* obstacle left → avoid right */
+              LineFollow_SetMode(MODE_RIGHT);
+              s_radar_avoid_dir = MODE_RIGHT;
+            } else {
+              /* obstacle right → avoid left */
+              LineFollow_SetMode(MODE_LEFT);
+              s_radar_avoid_dir = MODE_LEFT;
+            }
+            s_radar_state = RADAR_AVOID;
+          }
+        } else {
+          s_radar_target_cnt = 0U;
+        }
+        Motion_Car_Control(0, 0, 0);
+        break;
+
+      case RADAR_AVOID:
+        /* avoid timeout: 15s → back to follow */
+        if (now - s_radar_target_tick > RADAR_AVOID_TIMEOUT_MS) {
+          LineFollow_SetMode(s_pre_radar_mode);
+          s_radar_state = RADAR_FOLLOW;
+          break;
+        }
+        LineWalking();
+        break;
+      }
+    } else {
+      LineWalking();
+    }
 
     /* button: PB12=radar toggle, PB13=left↔right, 200ms debounce */
     if ((uint32_t)(HAL_GetTick() - s_btn_last_tick) >= 200U) {
       if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_RESET) {
-        s_radar_mode = (uint8_t)(!s_radar_mode);
+        if (s_radar_mode) {
+          /* exit radar: restore pre-radar mode */
+          LineFollow_SetMode(s_pre_radar_mode);
+          s_radar_mode  = 0U;
+          s_radar_state = RADAR_FOLLOW;
+        } else {
+          /* enter radar: save current mode */
+          s_pre_radar_mode = LineFollow_GetMode();
+          s_radar_state    = RADAR_FOLLOW;
+          s_radar_mode     = 1U;
+        }
         s_btn_last_tick = HAL_GetTick();
       } else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) {
         if (!s_radar_mode)
@@ -443,6 +645,12 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* OpenMV P0 trigger input, active high, pull-down default low */
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

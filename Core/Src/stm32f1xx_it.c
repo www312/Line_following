@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ir_line8.h"
+#include "f302_radar_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -231,5 +232,13 @@ void USART2_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	F302_Radar_UartRxCplt(huart);
+}
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	F302_Radar_UartError(huart);
+}
 /* USER CODE END 1 */

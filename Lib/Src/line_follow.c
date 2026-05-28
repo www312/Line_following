@@ -23,8 +23,8 @@ void LineWalking(void)
 	int right = (x5 == 0) + (x6 == 0) + (x7 == 0) + (x8 == 0);
 	uint8_t all_white = (left + right) == 0;
 
-	int16_t vz_search = (s_mode == MODE_RIGHT) ? -VZ_SEARCH : VZ_SEARCH;
-	int16_t vz_turn   = (s_mode == MODE_RIGHT) ? -VZ_TURN  : VZ_TURN;
+	int16_t vz_search = (s_mode == MODE_RIGHT) ? VZ_SEARCH_RIGHT : VZ_SEARCH_LEFT;
+	int16_t vz_turn   = (s_mode == MODE_RIGHT) ? VZ_TURN_RIGHT   : VZ_TURN_LEFT;
 
 	/* junction entry: arm hold only when line bias matches mode */
 	if ((left + right) > 4) {
@@ -76,7 +76,7 @@ void LineWalking(void)
 
 	/* deviating / turning: proportional with direction floor during hold */
 	int16_t vz = (int16_t)((right - left) * VZ_PER_ERR);
-	if (vz >  1500) vz =  1500;
+	if (vz >  2000) vz =  2000;
 	if (vz < -1500) vz = -1500;
 	if (hold_active) {
 		if (s_mode == MODE_LEFT  && vz > vz_turn) vz = vz_turn;
@@ -89,7 +89,7 @@ void LineWalking(void)
 void LineFollow_SetMode(LineFollow_Mode mode)
 {
 	s_mode = mode;
-	s_last_vz = (mode == MODE_RIGHT) ? -VZ_SEARCH : VZ_SEARCH;
+	s_last_vz = (mode == MODE_RIGHT) ? VZ_SEARCH_RIGHT : VZ_SEARCH_LEFT;
 }
 
 LineFollow_Mode LineFollow_GetMode(void) { return s_mode; }
