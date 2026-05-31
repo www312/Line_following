@@ -43,7 +43,7 @@
 
 #define SUPPRESS_MS          3000U   /* ignore PB12 for this window after any turn */
 #define RADAR_MODE_TIMEOUT_MS 5000U   /* quit RADAR_MODE if no all_black */
-#define STOP_DURATION_MS     1000U   /* stop & poll radar for 1s */
+#define STOP_DURATION_MS     3000U   /* stop & poll radar for 3s */
 #define STARTUP_IGNORE_MS    2000U   /* ignore PB12 for first 2s after power-on */
 #define LED_BLINK_MS         3000U   /* PA6 LED blinks for this long */
 #define AVOID_TIMEOUT_MS    15000U   /* max avoid duration */
@@ -423,9 +423,7 @@ int main(void)
      *  STATE MACHINE
      * ================================================================ */
     if (s_stop_active) {
-      /* ── STOP_1S: car halted, poll radar for 1s ── */
-      IR_Line8_PollRx();
-      F302_Radar_Poll();
+      /* ── STOP_1S: car halted, poll radar (top of loop already polled) ── */
 
       f302_target_t rd;
       F302_Radar_GetTarget(&rd);
