@@ -1,0 +1,72 @@
+@startuml top_level
+title 顶层调度状态机 — main.c while(1) (新版)
+hide empty description
+skinparam StateBackgroundColor<<radar>> #B3D9FF
+skinparam StateBackgroundColor<<stop>>  #FFD7D7
+skinparam StateBackgroundColor<<avoid>> #FFE4B5
+
+[*] --> NORMAL : 上电
+
+state NORMAL {
+  NORMAL : ▶ s_avoid_active = 0\n▶ s_radar_mode = 0\n▶ s_stop_active = 0
+  NORMAL : do / LineWalking()\n    UI_DrawSensorScreen()
+  NORMAL : suppressed 检查:\n  now − last_turn_tick < 3000ms\n  (左转和右转都会设置 last_turn_tick)
+}
+
+state RADAR_MODE <<radar>> {
+  RADAR_MODE : ▶ s_radar_mode = 1\n▶ s_pre_mode 已保存
+  RADAR_MODE : entry / s_radar_mode_tick = HAL_GetTick()\n         s_pre_mode = GetMode()
+  RADAR_MODE : do / LineWalking()\n    UI_DrawRadarScreen()\n    PA6 LED 闪烁 200ms (前3s)
+  RADAR_MODE : exit / PA6 LED 灭
+}
+
+state STOP_1S <<stop>> {
+  STOP_1S : ▶ s_stop_active = 1\n▶ 小车完全停止
+  STOP_1S : entry / Motion_Car_Control(0,0,0)\n         s_stop_tick = HAL_GetTick()\n         s_stop_has_target = 0
+  STOP_1S : do / 持续 IR_Line8_PollRx()\n    F302_Radar_Poll()\n    统计有效目标
+  STOP_1S : 有效目标定义:\n  have_target && range≤60cm\n              && |angle|≤60°
+}
+
+state AVOID <<avoid>> {
+  AVOID : ▶ s_avoid_active = 1
+  AVOID : entry / angle<0? SetMode(RIGHT) : SetMode(LEFT)\n         s_avoid_tick = HAL_GetTick()
+  AVOID : do / LineWalking()\n    UI_DrawRadarScreen()
+  AVOID : exit / LineFollow_SetMode(s_pre_mode)
+}
+
+' ── 状态迁移 ──
+
+NORMAL --> RADAR_MODE : PB12 上升沿 (P0 LOW→HIGH)\n&& !suppressed\n&& now ≥ 2000ms (上电屏蔽)
+
+RADAR_MODE --> NORMAL : PB12 变 LOW (摄像头丢失T字)\n—— OR ——\nnow − s_radar_mode_tick > 5000ms\n(5s 未等到 all_black)
+
+RADAR_MODE --> STOP_1S : all_black (8路灰度全黑)
+
+STOP_1S --> AVOID   : now − s_stop_tick ≥ 1000ms\n&& s_stop_has_target == 1\n(1s内至少1帧有效目标)
+
+STOP_1S --> NORMAL  : now − s_stop_tick ≥ 1000ms\n&& s_stop_has_target == 0\n(无有效目标, 保持原 mode)
+
+AVOID --> NORMAL : now − s_avoid_tick > 15000ms\n(15s 超时, 恢复 pre_mode)
+
+' ── 注释 ──
+
+note right of NORMAL
+  suppressed 改进 (line_follow.c):
+    旧: 仅右转后 suppressed
+    新: 左转和右转后都 suppressed 3000ms
+
+  删除的功能:
+    ✗ PB13 短按切换 mode
+    ✗ PB13 长按强制避障
+    ✗ 6帧历史投票
+    ✗ TrigState 枚举
+    ✗ TRIG_DONE 永久锁定
+end note
+
+note bottom of AVOID
+  避障结束后回到 NORMAL,
+  可以再次触发（不再有永久锁定）。
+  s_pre_mode 在进入时保存，退出时恢复。
+end note
+
+@enduml

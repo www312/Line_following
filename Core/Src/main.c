@@ -34,16 +34,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-typedef enum { RADAR_FOLLOW, RADAR_STOPPED, RADAR_AVOID } radar_state_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define UI_STEP_MS 50U
-#define OLED_I2C_ADDR 0x3CU
-#define RADAR_WAIT_TIMEOUT_MS 30000U
-#define RADAR_AVOID_TIMEOUT_MS 15000U
-#define RADAR_TARGET_CONFIRM   5U
+#define UI_STEP_MS            50U
+#define OLED_I2C_ADDR        0x3CU
+
+#define SUPPRESS_MS          3000U   /* ignore PB12 for this window after any turn */
+#define RADAR_MODE_TIMEOUT_MS 5000U   /* quit RADAR_MODE if no all_black */
+#define STOP_DURATION_MS     1000U   /* stop & poll radar for 1s */
+#define STARTUP_IGNORE_MS    2000U   /* ignore PB12 for first 2s after power-on */
+#define LED_BLINK_MS         3000U   /* PA6 LED blinks for this long */
+#define AVOID_TIMEOUT_MS    15000U   /* max avoid duration */
+#define RADAR_DIST_THRESH_CM   60U   /* max valid obstacle range */
+#define RADAR_ANGLE_LIMIT     6000   /* ±60 deg in 0.01deg units */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,16 +64,22 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 static uint32_t s_ui_last_tick;
-static uint32_t s_btn_last_tick;
 static u8g2_t s_u8g2;
-static uint8_t s_radar_mode; /* 0=follow, 1=radar */
-static radar_state_t s_radar_state = RADAR_FOLLOW;
-static uint32_t       s_radar_allblack_tick;
-static uint32_t       s_radar_target_tick;
-static LineFollow_Mode s_pre_radar_mode;
-static uint8_t        s_radar_avoid_dir;
-static uint8_t        s_radar_target_cnt;
-static uint8_t        s_radar_triggered_once; /* OpenMV P0 只触发一次 */
+
+/* ---- state machine ---- */
+static uint8_t         s_avoid_active;
+static uint32_t        s_avoid_tick;
+static LineFollow_Mode s_pre_mode;       /* saved mode before entering avoid */
+
+static uint8_t         s_radar_mode;      /* 1 = RADAR_MODE, waiting for all_black */
+static uint32_t        s_radar_mode_tick; /* entry tick for 5s timeout */
+
+static uint8_t         s_stop_active;     /* 1 = STOP_1S, car halted reading radar */
+static uint32_t        s_stop_tick;       /* entry tick for 1s duration */
+static uint8_t         s_stop_has_target; /* 1 = saw at least one valid target */
+static int16_t         s_stop_angle;      /* last valid angle during stop (-60..+60 deg * 100) */
+
+static uint8_t         s_pb12_prev;       /* previous PB12 for rising-edge detect */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,7 +95,7 @@ static void UI_DrawRadarScreen(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* ---- radar polar coordinate helpers ---- */
+/* ---- radar polar coordinate helpers (same as before) ---- */
 #define RADAR_CX 64
 #define RADAR_CY 50
 #define RADAR_R  28
@@ -166,7 +177,7 @@ uint8_t u8x8_byte_hw_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_p
 	return 1;
 }
 
-/* ---- OLED display: sensor dashboard ---- */
+/* ---- OLED: sensor dashboard (NORMAL mode) ---- */
 static void UI_DrawSensorScreen(void)
 {
 	char buf[32];
@@ -178,7 +189,7 @@ static void UI_DrawSensorScreen(void)
 	u8g2_SetFont(&s_u8g2, u8g2_font_helvB08_tr);
 	u8g2_DrawStr(&s_u8g2, 24, 10, "GRAY SENSOR");
 
-	/* 8 indicator blocks: 14x22 px, 2px gap, S8 left→S1 right */
+	/* 8 indicator blocks: S8 leftmost → S1 rightmost */
 	for (i = 0; i < 8; i++) {
 		uint8_t x = (uint8_t)(1U + (7U - i) * 16U);
 		if (IR_Line8_Value[i] == 0U)
@@ -187,24 +198,37 @@ static void UI_DrawSensorScreen(void)
 			u8g2_DrawFrame(&s_u8g2, x, 18, 14, 22);
 	}
 
-	/* S1-S8 labels under blocks */
+	/* S1-S8 labels */
 	u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
 	for (i = 0; i < 8; i++) {
 		buf[0] = 'S'; buf[1] = (char)('1' + i); buf[2] = '\0';
 		u8g2_DrawStr(&s_u8g2, (uint8_t)(3U + (7U - i) * 16U), 50, buf);
 	}
 
-	/* Status line: show DET/CLE groups */
-	buf[0] = 'D'; buf[1] = ':';
-	for (i = 0; i < 8; i++)
-		buf[2 + i] = (char)('0' + (IR_Line8_Value[i] & 1U));
-	buf[10] = '\0';
+	/* Status line: current mode + suppressed indicator */
+	{
+		uint32_t now = HAL_GetTick();
+		uint32_t lt = LineFollow_GetLastTurnTick();
+		uint8_t  suppressed = (lt != 0U && (uint32_t)(now - lt) < SUPPRESS_MS);
+		LineFollow_Mode m = LineFollow_GetMode();
+
+		if (suppressed) {
+			uint32_t remain = SUPPRESS_MS - (uint32_t)(now - lt);
+			snprintf(buf, sizeof(buf), "%s SU%lu.%lus",
+				 (m == MODE_RIGHT) ? "R" : "L",
+				 (unsigned long)(remain / 1000U),
+				 (unsigned long)((remain / 100U) % 10U));
+		} else {
+			snprintf(buf, sizeof(buf), "FOLLOW %s",
+				 (m == MODE_RIGHT) ? "R" : "L");
+		}
+	}
 	u8g2_DrawStr(&s_u8g2, 0, 62, buf);
 
 	u8g2_SendBuffer(&s_u8g2);
 }
 
-/* ---- OLED display: radar mode ---- */
+/* ---- OLED: radar mode (RADAR_MODE / STOP_1S / AVOID) ---- */
 static void UI_DrawRadarScreen(void)
 {
 	f302_target_t rd;
@@ -273,34 +297,30 @@ static void UI_DrawRadarScreen(void)
 		}
 	}
 
-		/* status bar */
-		u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
-		switch (s_radar_state) {
-		case RADAR_FOLLOW:
-			snprintf(buf, sizeof(buf), "FOLLOW");
-			break;
-		case RADAR_STOPPED: {
-			uint32_t elapsed = (now - s_radar_allblack_tick) / 1000U;
-			if (s_radar_target_cnt > 0U)
-				snprintf(buf, sizeof(buf), "STOP c%u/5",
-					 (unsigned)s_radar_target_cnt);
-			else
-				snprintf(buf, sizeof(buf), "STOP %lus",
-					 (unsigned long)elapsed);
-			break;
-		}
-		case RADAR_AVOID: {
-			uint32_t remain = 0U;
-			if (now < s_radar_target_tick + RADAR_AVOID_TIMEOUT_MS)
-				remain = (s_radar_target_tick + RADAR_AVOID_TIMEOUT_MS
-					  - now) / 1000U;
-			snprintf(buf, sizeof(buf), "AVOID %c %lus",
-				 (s_radar_avoid_dir == MODE_RIGHT) ? 'R' : 'L',
-				 (unsigned long)remain);
-			break;
-		}
-		}
-		u8g2_DrawStr(&s_u8g2, 0, 62, buf);
+	/* status bar */
+	u8g2_SetFont(&s_u8g2, u8g2_font_6x10_tr);
+	if (s_stop_active) {
+		uint32_t remain = STOP_DURATION_MS - (uint32_t)(now - s_stop_tick);
+		snprintf(buf, sizeof(buf), "STOP %lu.%lus",
+			 (unsigned long)(remain / 1000U),
+			 (unsigned long)((remain / 100U) % 10U));
+	} else if (s_radar_mode) {
+		uint32_t remain = 0U;
+		if (now < s_radar_mode_tick + RADAR_MODE_TIMEOUT_MS)
+			remain = (s_radar_mode_tick + RADAR_MODE_TIMEOUT_MS - now) / 1000U;
+		snprintf(buf, sizeof(buf), "RADAR %lus", (unsigned long)remain);
+	} else if (s_avoid_active) {
+		uint32_t remain = 0U;
+		if (now < s_avoid_tick + AVOID_TIMEOUT_MS)
+			remain = (s_avoid_tick + AVOID_TIMEOUT_MS - now) / 1000U;
+		LineFollow_Mode m = LineFollow_GetMode();
+		snprintf(buf, sizeof(buf), "AVOID %c %lus",
+			 (m == MODE_RIGHT) ? 'R' : 'L',
+			 (unsigned long)remain);
+	} else {
+		snprintf(buf, sizeof(buf), "FOLLOW");
+	}
+	u8g2_DrawStr(&s_u8g2, 0, 62, buf);
 
 	u8g2_SendBuffer(&s_u8g2);
 }
@@ -348,6 +368,14 @@ int main(void)
   u8g2_InitDisplay(&s_u8g2);
   u8g2_SetPowerSave(&s_u8g2, 0);
   F302_Radar_Init(&huart1);
+
+  /* init state machine */
+  s_avoid_active  = 0U;
+  s_radar_mode    = 0U;
+  s_stop_active   = 0U;
+  s_stop_has_target = 0U;
+  s_pb12_prev     = 0U;
+
   s_ui_last_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
@@ -361,112 +389,113 @@ int main(void)
     IR_Line8_PollRx();
     F302_Radar_Poll();
 
-    /* ---- radar state machine ---- */
-    /* OpenMV P0 → PB14: enter radar mode (same as PB12), one-shot only */
-    /* skip check in first 1s to avoid false trigger during OpenMV boot */
-    if (!s_radar_mode && !s_radar_triggered_once
-        && HAL_GetTick() > 1000U
-        && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_14) == GPIO_PIN_SET) {
-      s_radar_triggered_once = 1;
-      s_pre_radar_mode = LineFollow_GetMode();
-      s_radar_state    = RADAR_FOLLOW;
-      s_radar_mode     = 1U;
+    uint32_t now = HAL_GetTick();
+
+    /* ---- all_black: 8 sensors on black line ---- */
+    uint8_t all_black = 1U;
+    for (uint8_t i = 0U; i < 8U; i++) {
+      if (IR_Line8_Value[i] != 0U) { all_black = 0U; break; }
     }
 
+    /* ---- PB12: camera T-junction signal ---- */
+    uint8_t pb12       = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_SET) ? 1U : 0U;
+    uint8_t pb12_rise  = (pb12 == 1U && s_pb12_prev == 0U) ? 1U : 0U;
+    s_pb12_prev = pb12;
+
+    /* ---- suppressed: window after any left/right turn ---- */
+    uint32_t last_turn = LineFollow_GetLastTurnTick();
+    uint8_t suppressed = (last_turn != 0U && (uint32_t)(now - last_turn) < SUPPRESS_MS);
+
+    /* ---- PA6 LED: blink 200ms on/off for first LED_BLINK_MS of RADAR_MODE ---- */
     if (s_radar_mode) {
-      uint32_t now = HAL_GetTick();
-      uint8_t all_black = 1U;
-      f302_target_t rd;
-
-      for (uint8_t i = 0U; i < 8U; i++) {
-        if (IR_Line8_Value[i] != 0U) { all_black = 0U; break; }
-      }
-
-      switch (s_radar_state) {
-      case RADAR_FOLLOW:
-        if (all_black) {
-          Motion_Car_Control(0, 0, 0);
-          s_radar_allblack_tick = now;
-          s_radar_target_cnt   = 0U;
-          s_radar_state = RADAR_STOPPED;
-        } else {
-          LineWalking();
-        }
-        break;
-
-      case RADAR_STOPPED:
-        /* wait timeout: 30s no target → back to follow */
-        if (now - s_radar_allblack_tick > RADAR_WAIT_TIMEOUT_MS) {
-          s_radar_state = RADAR_FOLLOW;
-          break;
-        }
-        F302_Radar_GetTarget(&rd);
-        if (rd.have_target) {
-          s_radar_target_cnt++;
-          if (s_radar_target_cnt >= RADAR_TARGET_CONFIRM) {
-            s_radar_target_tick = now;
-            if (rd.angle_0p01deg < 0) {
-              /* obstacle left → avoid right */
-              LineFollow_SetMode(MODE_RIGHT);
-              s_radar_avoid_dir = MODE_RIGHT;
-            } else {
-              /* obstacle right → avoid left */
-              LineFollow_SetMode(MODE_LEFT);
-              s_radar_avoid_dir = MODE_LEFT;
-            }
-            s_radar_state = RADAR_AVOID;
-          }
-        } else {
-          s_radar_target_cnt = 0U;
-        }
-        Motion_Car_Control(0, 0, 0);
-        break;
-
-      case RADAR_AVOID:
-        /* avoid timeout: 15s → back to follow */
-        if (now - s_radar_target_tick > RADAR_AVOID_TIMEOUT_MS) {
-          LineFollow_SetMode(s_pre_radar_mode);
-          s_radar_state = RADAR_FOLLOW;
-          break;
-        }
-        LineWalking();
-        break;
+      uint32_t led_elapsed = (uint32_t)(now - s_radar_mode_tick);
+      if (led_elapsed < LED_BLINK_MS) {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6,
+            ((led_elapsed / 200U) % 2U == 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      } else {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
       }
     } else {
-      LineWalking();
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
     }
 
-    /* button: PB12=radar toggle, PB13=left↔right, 200ms debounce */
-    if ((uint32_t)(HAL_GetTick() - s_btn_last_tick) >= 200U) {
-      if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_12) == GPIO_PIN_RESET) {
-        if (s_radar_mode) {
-          /* exit radar: restore pre-radar mode */
-          LineFollow_SetMode(s_pre_radar_mode);
-          s_radar_mode  = 0U;
-          s_radar_state = RADAR_FOLLOW;
-        } else {
-          /* enter radar: save current mode */
-          s_pre_radar_mode = LineFollow_GetMode();
-          s_radar_state    = RADAR_FOLLOW;
-          s_radar_mode     = 1U;
+    /* ================================================================
+     *  STATE MACHINE
+     * ================================================================ */
+    if (s_stop_active) {
+      /* ── STOP_1S: car halted, poll radar for 1s ── */
+      IR_Line8_PollRx();
+      F302_Radar_Poll();
+
+      f302_target_t rd;
+      F302_Radar_GetTarget(&rd);
+      if (rd.have_target
+          && rd.range_0p01m <= (uint16_t)RADAR_DIST_THRESH_CM
+          && rd.angle_0p01deg >= -RADAR_ANGLE_LIMIT
+          && rd.angle_0p01deg <=  RADAR_ANGLE_LIMIT) {
+        s_stop_has_target = 1U;
+        s_stop_angle = rd.angle_0p01deg;
+      }
+
+      if ((uint32_t)(now - s_stop_tick) >= STOP_DURATION_MS) {
+        s_stop_active = 0U;
+        if (s_stop_has_target) {
+          /* obstacle detected → enter AVOID */
+          if (s_stop_angle < 0) {
+            LineFollow_SetMode(MODE_RIGHT);   /* obstacle left → go right */
+          } else {
+            LineFollow_SetMode(MODE_LEFT);    /* obstacle right → go left */
+          }
+          s_avoid_active = 1U;
+          s_avoid_tick   = now;
         }
-        s_btn_last_tick = HAL_GetTick();
-      } else if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == GPIO_PIN_RESET) {
-        if (!s_radar_mode)
-          LineFollow_SetMode(LineFollow_GetMode() == MODE_LEFT ? MODE_RIGHT : MODE_LEFT);
-        s_btn_last_tick = HAL_GetTick();
+        /* else: no target → back to NORMAL, keep original mode */
+      }
+
+    } else if (s_avoid_active) {
+      /* ── AVOID: line-walk with avoid direction ── */
+      LineWalking();
+      if ((uint32_t)(now - s_avoid_tick) >= AVOID_TIMEOUT_MS) {
+        LineFollow_SetMode(s_pre_mode);
+        s_avoid_active = 0U;
+      }
+
+    } else if (s_radar_mode) {
+      /* ── RADAR_MODE: wait for all_black or timeout ── */
+      LineWalking();
+      if (!pb12) {
+        /* camera lost T-junction before all_black → back to NORMAL */
+        s_radar_mode = 0U;
+      } else if (all_black) {
+        /* all_black trigger → stop and read radar */
+        s_radar_mode = 0U;
+        Motion_Car_Control(0, 0, 0);
+        s_stop_active     = 1U;
+        s_stop_tick       = now;
+        s_stop_has_target = 0U;
+      } else if ((uint32_t)(now - s_radar_mode_tick) >= RADAR_MODE_TIMEOUT_MS) {
+        /* 5s timeout → back to NORMAL */
+        s_radar_mode = 0U;
+      }
+
+    } else {
+      /* ── NORMAL: line-walk, wait for camera T-junction ── */
+      LineWalking();
+      if (pb12_rise && !suppressed && now >= STARTUP_IGNORE_MS) {
+        s_radar_mode      = 1U;
+        s_radar_mode_tick = now;
+        s_pre_mode        = LineFollow_GetMode();
       }
     }
 
-    if (!s_radar_mode)
-      LineWalking();
-
-    if ((uint32_t)(HAL_GetTick() - s_ui_last_tick) >= UI_STEP_MS) {
-      s_ui_last_tick = HAL_GetTick();
-      if (s_radar_mode)
+    /* ---- UI refresh ---- */
+    if ((uint32_t)(now - s_ui_last_tick) >= UI_STEP_MS) {
+      s_ui_last_tick = now;
+      if (s_avoid_active || s_radar_mode || s_stop_active) {
         UI_DrawRadarScreen();
-      else
+      } else {
         UI_DrawSensorScreen();
+      }
     }
   }
   /* USER CODE END 3 */
@@ -646,11 +675,13 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* OpenMV P0 trigger input, active high, pull-down default low */
-  GPIO_InitStruct.Pin = GPIO_PIN_14;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /* PA6: LED indicator, push-pull output, default low */
+  GPIO_InitStruct.Pin = GPIO_PIN_6;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

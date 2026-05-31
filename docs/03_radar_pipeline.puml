@@ -1,0 +1,87 @@
+@startuml radar_pipeline
+title 雷达数据通路 — USART1 → 解析 → STOP_1S 采样 (新版)
+hide empty description
+skinparam StateBackgroundColor<<isr>>  #FFD7D7
+skinparam StateBackgroundColor<<stop>> #D7FFD7
+
+' ---- 中断 / DMA 端 ----
+state "ISR 入口" as ISR <<isr>> {
+  state ISR_RX  : HAL_UART_RxCpltCallback\n→ F302_Radar_UartRxCplt (uart.c:73)\n  • 写入 256 字节环形缓冲 s_rb\n  • 再次启动 HAL_UART_Receive_IT (1B)
+  state ISR_ERR : HAL_UART_ErrorCallback\n→ F302_Radar_UartError (uart.c:89)\n  • 读 SR/DR 清错\n  • HAL_UART_AbortReceive\n  • 重新挂上接收
+}
+
+' ---- 主循环字节级解析 ----
+state "字节级帧解析  f302_feed_byte (radar.c)" as PARSE {
+  [*] --> WAIT_HDR0
+  WAIT_HDR0 : s_idx == 0
+  WAIT_HDR1 : s_idx == 1, buf[0] 已收
+  COLLECT   : s_idx ∈ [2, 13]
+  VALIDATE  : s_idx == 14, 校验帧
+
+  WAIT_HDR0 --> WAIT_HDR1 : b == 0xAA || b == 0x55\n→ buf[0]=b, idx=1
+  WAIT_HDR0 --> WAIT_HDR0 : 其他
+
+  WAIT_HDR1 --> COLLECT  : 与 buf[0] 互补\n(0xAA→0x55 或 0x55→0xAA)\n→ buf[1]=b, idx=2
+  WAIT_HDR1 --> WAIT_HDR1 : 单独又收到 0xAA/0x55\n→ buf[0]=b, idx=1
+  WAIT_HDR1 --> WAIT_HDR0 : 其他 → idx=0
+
+  COLLECT  --> COLLECT  : idx < 14\n→ buf[idx++]=b
+  COLLECT  --> VALIDATE : idx == 14
+
+  VALIDATE --> WAIT_HDR0 : cmd ≠ 0xA206 ‖ len ≠ 6\n‖ Σbuf[0..11] & 0xFF ≠ buf[12]\n(整帧丢弃)
+  VALIDATE --> EMIT      : 全部通过
+  EMIT : out.range_0p01m  = LE16(buf[6..7])\nout.angle_0p01deg = −LE16(buf[8..9])\nout.have_target = (range != 0)\n(uart.c) s_target = out, s_linked = 1
+  EMIT --> WAIT_HDR0
+}
+
+ISR_RX --> PARSE : F302_Radar_Poll() 主循环 drain\n逐字节喂入
+
+' ---- STOP_1S 实时采样 (main.c) ----
+state "STOP_1S 实时采样 (新版)" as STOP <<stop>> {
+  [*] --> POLLING
+
+  POLLING : 小车完全停止\nIR_Line8_PollRx() + F302_Radar_Poll() 每圈调用\n持续读取 F302_Radar_GetTarget()
+  POLLING --> CHECK : 每圈检查当前帧
+
+  CHECK --> HIT  : have_target\n&& range_0p01m ≤ 60 (cm)\n&& |angle_0p01deg| ≤ 6000 (±60°)
+
+  CHECK --> MISS : 否则
+
+  HIT : s_stop_has_target = 1\ns_stop_angle = rd.angle_0p01deg\n(记录最后有效角度)
+  MISS : 本帧不记录
+
+  HIT --> POLLING : 继续下一帧
+  MISS --> POLLING : 继续下一帧
+
+  POLLING --> DECIDE : now − s_stop_tick ≥ 1000ms
+
+  DECIDE --> AVOID  : s_stop_has_target == 1\n→ 进入 AVOID\n  angle<0 → SetMode(RIGHT)\n  angle≥0 → SetMode(LEFT)
+  DECIDE --> NORMAL : s_stop_has_target == 0\n→ 回到 NORMAL\n  保持原 mode, 不修改
+}
+
+PARSE --> POLLING : s_target 持续被解析器更新\n(主循环每圈更新, 精度取决于 USART1 帧率)
+
+note right of ISR
+  USART1 配置 (main.c)
+    115200 8N1, PA9/PA10
+  缓冲: s_rb[256]
+  帧头: 0xAA 0x55 或 0x55 0xAA
+  命令: 0xA206 (主动上报)
+  帧长: 14 字节, payload 6 字节
+end note
+
+note bottom of STOP
+  关键宏 (main.c)
+  ─────────────────────────
+  STOP_DURATION_MS      1000
+  RADAR_DIST_THRESH_CM    60
+  RADAR_ANGLE_LIMIT     6000  (= ±60.00°)
+
+  相比旧版 6 帧投票的改进:
+  ✗ 删除: 6 帧滚动历史 & 投票
+  ✓ 新增: 停车后 1s 实时连续采样
+  ✓ 优点: 数据最新, 不受车身晃动影响
+  ✓ 只要 1s 内出现至少 1 帧有效目标即可确认
+end note
+
+@enduml
