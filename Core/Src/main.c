@@ -41,7 +41,7 @@
 #define UI_STEP_MS            50U
 #define OLED_I2C_ADDR        0x3CU
 
-#define SUPPRESS_MS          3000U   /* ignore PB12 for this window after any turn */
+#define SUPPRESS_MS          1500U   /* ignore PB12 for this window after any turn */
 #define RADAR_MODE_TIMEOUT_MS 5000U   /* quit RADAR_MODE if no all_black */
 #define STOP_DURATION_MS     3000U   /* stop & poll radar for 3s */
 #define STARTUP_IGNORE_MS    2000U   /* ignore PB12 for first 2s after power-on */
