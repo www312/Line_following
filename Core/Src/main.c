@@ -491,7 +491,7 @@ int main(void)
     /* ---- UI refresh ---- */
     if ((uint32_t)(now - s_ui_last_tick) >= UI_STEP_MS) {
       s_ui_last_tick = now;
-      if (s_avoid_active || s_radar_mode || s_stop_active) {
+      if (s_avoid_active || s_stop_active) {
         UI_DrawRadarScreen();
       } else {
         UI_DrawSensorScreen();
