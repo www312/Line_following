@@ -81,7 +81,7 @@ void LineWalking(void)
 	/* deviating / turning: proportional with direction floor during hold */
 	int16_t vz = (int16_t)((right - left) * VZ_PER_ERR);
 	if (vz >  2000) vz =  2000;
-	if (vz < -1500) vz = -1500;
+	if (vz < -2000) vz = -2000;
 	if (hold_active) {
 		if (s_mode == MODE_LEFT  && vz > vz_turn) vz = vz_turn;
 		if (s_mode == MODE_RIGHT && vz < vz_turn) vz = vz_turn;
