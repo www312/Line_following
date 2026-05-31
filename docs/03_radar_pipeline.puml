@@ -1,14 +1,24 @@
 @startuml radar_pipeline
-title 雷达数据通路 — USART1 → 解析 → STOP_1S 采样 (新版)
+title 雷达数据通路 — USART1 → 解析 → STOP_1S 采样 (v3)
 hide empty description
-skinparam StateBackgroundColor<<isr>>  #FFD7D7
-skinparam StateBackgroundColor<<stop>> #D7FFD7
+skinparam StateBackgroundColor<<isr>>   #FFD7D7
+skinparam StateBackgroundColor<<stop>>  #D7FFD7
+skinparam StateBackgroundColor<<cam>>   #FFE4B5
 
 ' ---- 中断 / DMA 端 ----
 state "ISR 入口" as ISR <<isr>> {
   state ISR_RX  : HAL_UART_RxCpltCallback\n→ F302_Radar_UartRxCplt (uart.c:73)\n  • 写入 256 字节环形缓冲 s_rb\n  • 再次启动 HAL_UART_Receive_IT (1B)
   state ISR_ERR : HAL_UART_ErrorCallback\n→ F302_Radar_UartError (uart.c:89)\n  • 读 SR/DR 清错\n  • HAL_UART_AbortReceive\n  • 重新挂上接收
 }
+
+' ---- OpenMV 摄像头 ----
+state "OpenMV 摄像头" as CAM <<cam>> {
+  CAM : Edge Impulse 模型\n48×48 GRAYSCALE\nlabels: background / curve
+  CAM : curve 连续4帧 && score≥0.58\n→ P0 HIGH (T字路口)
+  CAM : curve 消失 → P0 LOW\ncooldown 1800ms
+}
+
+CAM --> STM32 : P0 ──▶ PB12 (INPUT_PULLUP)\nHIGH=T字, LOW=清除
 
 ' ---- 主循环字节级解析 ----
 state "字节级帧解析  f302_feed_byte (radar.c)" as PARSE {
@@ -21,14 +31,14 @@ state "字节级帧解析  f302_feed_byte (radar.c)" as PARSE {
   WAIT_HDR0 --> WAIT_HDR1 : b == 0xAA || b == 0x55\n→ buf[0]=b, idx=1
   WAIT_HDR0 --> WAIT_HDR0 : 其他
 
-  WAIT_HDR1 --> COLLECT  : 与 buf[0] 互补\n(0xAA→0x55 或 0x55→0xAA)\n→ buf[1]=b, idx=2
+  WAIT_HDR1 --> COLLECT  : 与 buf[0] 互补\n→ buf[1]=b, idx=2
   WAIT_HDR1 --> WAIT_HDR1 : 单独又收到 0xAA/0x55\n→ buf[0]=b, idx=1
   WAIT_HDR1 --> WAIT_HDR0 : 其他 → idx=0
 
   COLLECT  --> COLLECT  : idx < 14\n→ buf[idx++]=b
   COLLECT  --> VALIDATE : idx == 14
 
-  VALIDATE --> WAIT_HDR0 : cmd ≠ 0xA206 ‖ len ≠ 6\n‖ Σbuf[0..11] & 0xFF ≠ buf[12]\n(整帧丢弃)
+  VALIDATE --> WAIT_HDR0 : cmd ≠ 0xA206 ‖ len ≠ 6\n‖ Σbuf[0..11] & 0xFF ≠ buf[12]
   VALIDATE --> EMIT      : 全部通过
   EMIT : out.range_0p01m  = LE16(buf[6..7])\nout.angle_0p01deg = −LE16(buf[8..9])\nout.have_target = (range != 0)\n(uart.c) s_target = out, s_linked = 1
   EMIT --> WAIT_HDR0
@@ -36,52 +46,59 @@ state "字节级帧解析  f302_feed_byte (radar.c)" as PARSE {
 
 ISR_RX --> PARSE : F302_Radar_Poll() 主循环 drain\n逐字节喂入
 
-' ---- STOP_1S 实时采样 (main.c) ----
-state "STOP_1S 实时采样 (新版)" as STOP <<stop>> {
+' ---- 触发链路 ----
+state "触发链路 (main.c)" as TRIGGER <<stop>> {
+  [*] --> CAMERA
+  CAMERA : PB12 上升沿\n&& !suppressed (2500ms)\n&& 上电 > 2s
+  CAMERA --> RADAR_WAIT : 进入 RADAR_MODE\nPA6 LED 闪烁 3s
+  RADAR_WAIT : LineWalking 继续巡线\nUI 保持 Sensor 画面\n等 all_black (5s超时)
+  RADAR_WAIT --> STOP : all_black (8路全黑)
+  RADAR_WAIT --> NORMAL : PB12↓ 或 5s超时
+}
+
+' ---- STOP_1S 实时采样 ----
+state "STOP_1S 实时采样" as STOP_SAMPLE <<stop>> {
   [*] --> POLLING
 
-  POLLING : 小车完全停止\nIR_Line8_PollRx() + F302_Radar_Poll() 每圈调用\n持续读取 F302_Radar_GetTarget()
-  POLLING --> CHECK : 每圈检查当前帧
+  POLLING : 小车完全停止\n切到雷达 UI\nIR_Line8_PollRx() + F302_Radar_Poll()\n每圈读取 F302_Radar_GetTarget()
+  POLLING --> CHECK : 每圈检查
 
-  CHECK --> HIT  : have_target\n&& range_0p01m ≤ 60 (cm)\n&& |angle_0p01deg| ≤ 6000 (±60°)
+  CHECK --> HIT  : have_target\n&& range≤60cm\n&& |angle|≤60°
 
   CHECK --> MISS : 否则
 
-  HIT : s_stop_has_target = 1\ns_stop_angle = rd.angle_0p01deg\n(记录最后有效角度)
-  MISS : 本帧不记录
+  HIT : s_stop_has_target = 1\ns_stop_angle = rd.angle_0p01deg
+  MISS : 不记录
 
-  HIT --> POLLING : 继续下一帧
-  MISS --> POLLING : 继续下一帧
+  HIT --> POLLING : 继续
+  MISS --> POLLING : 继续
 
   POLLING --> DECIDE : now − s_stop_tick ≥ 1000ms
 
-  DECIDE --> AVOID  : s_stop_has_target == 1\n→ 进入 AVOID\n  angle<0 → SetMode(RIGHT)\n  angle≥0 → SetMode(LEFT)
-  DECIDE --> NORMAL : s_stop_has_target == 0\n→ 回到 NORMAL\n  保持原 mode, 不修改
+  DECIDE --> AVOID  : s_stop_has_target == 1\nangle<0 → SetMode(RIGHT)\nangle≥0 → SetMode(LEFT)\n切到 AVOID (雷达UI保持)
+  DECIDE --> NORMAL : s_stop_has_target == 0\n回 NORMAL (保持原mode)
 }
 
-PARSE --> POLLING : s_target 持续被解析器更新\n(主循环每圈更新, 精度取决于 USART1 帧率)
+PARSE --> POLLING : s_target 持续更新
 
 note right of ISR
-  USART1 配置 (main.c)
-    115200 8N1, PA9/PA10
+  USART1: 115200 8N1, PA9/PA10
   缓冲: s_rb[256]
-  帧头: 0xAA 0x55 或 0x55 0xAA
-  命令: 0xA206 (主动上报)
-  帧长: 14 字节, payload 6 字节
+  帧头: 0xAA 0x55 / 0x55 0xAA
+  命令: 0xA206
+  帧长: 14B, payload 6B
 end note
 
-note bottom of STOP
+note bottom of TRIGGER
   关键宏 (main.c)
   ─────────────────────────
+  SUPPRESS_MS           2500
+  RADAR_MODE_TIMEOUT_MS 5000
   STOP_DURATION_MS      1000
+  AVOID_TIMEOUT_MS     15000
+  STARTUP_IGNORE_MS     2000
   RADAR_DIST_THRESH_CM    60
-  RADAR_ANGLE_LIMIT     6000  (= ±60.00°)
-
-  相比旧版 6 帧投票的改进:
-  ✗ 删除: 6 帧滚动历史 & 投票
-  ✓ 新增: 停车后 1s 实时连续采样
-  ✓ 优点: 数据最新, 不受车身晃动影响
-  ✓ 只要 1s 内出现至少 1 帧有效目标即可确认
+  RADAR_ANGLE_LIMIT     6000
 end note
 
 @enduml

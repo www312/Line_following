@@ -1,12 +1,12 @@
 @startuml line_walking
-title LineWalking() 行为分支  —  line_follow.c (每次调用走一次)
+title LineWalking() 行为分支 — line_follow.c (每次调用走一次)
 hide empty description
 
 [*] --> PRE
 
 state "前置阶段 (line 17-50)" as PRE {
-  PRE : x1..x8 = IR_Line8_Value[0..7]\nleft  = (x1==0)+(x2==0)+(x3==0)+(x4==0)\nright = (x5==0)+(x6==0)+(x7==0)+(x8==0)\nall_white = (left+right == 0)\nvz_search = (mode==RIGHT) ? +3000 : -3000\nvz_turn   = (mode==RIGHT) ? +4000 : -2600
-  PRE : ── 路口装弹 (line 32-39) ──\nif (left+right) ≥ 4:\n  mode==LEFT  && left>right  → turn_until = frame + 30\n  mode==RIGHT && right>left  → turn_until = frame + 30\n  right > left               → s_last_right_turn_tick = HAL_GetTick()
+  PRE : x1..x8 = IR_Line8_Value[0..7]\nleft  = (x1==0)+(x2==0)+(x3==0)+(x4==0)\nright = (x5==0)+(x6==0)+(x7==0)+(x8==0)\nall_white = (left+right == 0)\nvz_search = (mode==RIGHT) ? +2500 : -2500\nvz_turn   = (mode==RIGHT) ? +2000 : -2000
+  PRE : ── 路口装弹 (line 32-39) ──\nif (left+right) ≥ 4:\n  mode==LEFT  && left>right  → turn_until = frame + 30\n  mode==RIGHT && right>left  → turn_until = frame + 30\n  left>right || right>left   → s_last_turn_tick = HAL_GetTick()
   PRE : ── 持锁延长 (line 44-50) ──\nhold_active = (frame < turn_until)\nif hold && mode==LEFT  && (left-right) ≥ 2 → turn_until += 30\nif hold && mode==RIGHT && (right-left) ≥ 2 → turn_until += 30
 }
 
@@ -35,7 +35,7 @@ state LOST {
 }
 
 state "比例修正 (line 82-91)" as PROP {
-  PROP : vz = (right − left) * 550   (VZ_PER_ERR)\n限幅 vz ∈ [−1500, +2000]\n── hold 钳制 (确保转向不被误抹平) ──\nhold && mode==LEFT  && vz > −2600 → vz = −2600\nhold && mode==RIGHT && vz < +4000 → vz = +4000\nif s_last_vz==0 || sign(vz)==sign(s_last_vz):\n   s_last_vz = vz\nMotion_Car_Control(150, 0, vz)
+  PROP : vz = (right − left) * 550   (VZ_PER_ERR)\n限幅 vz ∈ [−2000, +2000]  (对称)\n── hold 钳制 ──\nhold && mode==LEFT  && vz > −2000 → vz = −2000\nhold && mode==RIGHT && vz < +2000 → vz = +2000\nif s_last_vz==0 || sign(vz)==sign(s_last_vz):\n   s_last_vz = vz\nMotion_Car_Control(150, 0, vz)
 }
 
 SYM      --> [*]
@@ -44,26 +44,25 @@ LOST     --> [*]
 PROP     --> [*]
 
 note right of PRE
-  常量  (line_follow.h)
+  常量  (line_follow.h) — 已对称化
   ─────────────────────
   IRR_SPEED         150
   VZ_PER_ERR        550
-  VZ_SEARCH_LEFT  −3000      VZ_SEARCH_RIGHT  +3000
-  VZ_TURN_LEFT    −2600      VZ_TURN_RIGHT    +4000
+  VZ_SEARCH_LEFT  −2500      VZ_SEARCH_RIGHT  +2500
+  VZ_TURN_LEFT    −2000      VZ_TURN_RIGHT    +2000
   TURN_HOLD          30 帧
 
   全局状态  (line_follow.c)
   ─────────────────────────
-  s_mode                  : MODE_LEFT / MODE_RIGHT
-  s_last_vz               : 上次输出, 用于 LOST 续转
-  s_last_right_turn_tick  : 主循环用来判 SUPPRESS 窗口
-  turn_until (static 局部) : 帧计数, 决定 hold_active
+  s_mode              : MODE_LEFT / MODE_RIGHT
+  s_last_vz           : 上次输出, 用于 LOST 续转
+  s_last_turn_tick    : 主循环判 SUPPRESS (左右转都写)
+  turn_until (static) : 帧计数, 决定 hold_active
 end note
 
 note bottom of SYM
-  注: SYM 里的 delay_ms(100) 会阻塞主循环
-  → 期间 IR_Line8_PollRx / F302_Radar_Poll 暂停,
-     雷达投票"漏帧"是有意为之 (先冲过路口再判断).
+  注: delay_ms(100) 阻塞主循环,
+  IR_Line8_PollRx / F302_Radar_Poll 暂停.
 end note
 
 @enduml
